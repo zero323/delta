@@ -22,6 +22,7 @@ jobs:
             pyenv global system 3.7.4
             pipenv install
             pipenv run pip install pyspark>=2.4.2
+            pipenv run pip install mypy pyspark-stubs>=2.4.0
       - run:
           name: Run Scala/Java and Python tests
           command: |
