@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,12 @@
 
 package org.apache.spark.sql.delta
 
+import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import io.delta.tables.{DeltaTable, DeltaTableTestUtils}
 
 import org.apache.spark.sql.{functions, Row}
 
-class DeleteScalaSuite extends DeleteSuiteBase {
+class DeleteScalaSuite extends DeleteSuiteBase with DeltaSQLCommandTest {
 
   import testImplicits._
 

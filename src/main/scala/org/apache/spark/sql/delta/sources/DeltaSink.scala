@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -98,7 +98,7 @@ class DeltaSink(
     }
     val newFiles = txn.writeFiles(data, Some(options))
     val setTxn = SetTransaction(queryId, batchId, Some(deltaLog.clock.getTimeMillis())) :: Nil
-    val info = DeltaOperations.StreamingUpdate(outputMode, queryId, batchId)
+    val info = DeltaOperations.StreamingUpdate(outputMode, queryId, batchId, options.userMetadata)
     metrics("numRemovedFiles").set(deletedFiles.size)
     metrics("numAddedFiles").set(newFiles.size)
     txn.registerSQLMetrics(sqlContext.sparkSession, metrics)

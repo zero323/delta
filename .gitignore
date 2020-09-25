@@ -38,7 +38,6 @@ conf/*.properties
 conf/*.sh
 conf/*.xml
 conf/java-opts
-conf/slaves
 dependency-reduced-pom.xml
 derby.log
 dev/create-release/*final
@@ -102,3 +101,7 @@ spark-warehouse/
 
 # For SBT
 .jvmopts
+
+# For Python linting
+pep8*.py
+pycodestyle*.py

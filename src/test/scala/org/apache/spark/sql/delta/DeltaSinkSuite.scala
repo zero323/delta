@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import java.io.File
 import java.util.Locale
 
 import org.apache.spark.sql.delta.actions.CommitInfo
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.commons.io.FileUtils
 import org.scalatest.time.SpanSugar._
 
@@ -504,6 +505,30 @@ class DeltaSinkSuite extends StreamTest {
       checkAnswer(
         spark.read.format("delta").load(tableDir).drop("file"),
         Seq(Row("ss", Row("ss", null), null)))
+    }
+  }
+
+  test("history includes user-defined metadata for DataFrame.writeStream API") {
+    failAfter(streamingTimeout) {
+      withTempDirs { (outputDir, checkpointDir) =>
+        val inputData = MemoryStream[Int]
+        val df = inputData.toDF()
+        val query = df.writeStream
+          .option("checkpointLocation", checkpointDir.getCanonicalPath)
+          .option("userMetadata", "testMeta!")
+          .format("delta")
+          .start(outputDir.getCanonicalPath)
+        val log = DeltaLog.forTable(spark, outputDir.getCanonicalPath)
+
+        inputData.addData(1)
+        query.processAllAvailable()
+
+        val lastCommitInfo = io.delta.tables.DeltaTable.forPath(spark, outputDir.getCanonicalPath)
+            .history(1).as[CommitInfo].head
+
+        assert(lastCommitInfo.userMetadata === Some("testMeta!"))
+        query.stop()
+      }
     }
   }
 }

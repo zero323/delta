@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,8 +19,12 @@ package org.apache.spark.sql.delta
 import java.io.{File, FileNotFoundException}
 import java.util.concurrent.atomic.AtomicInteger
 
+// scalastyle:off import.ordering.noEmptyLine
+import org.apache.spark.sql.delta.actions.{CommitInfo, Protocol}
 import org.apache.spark.sql.delta.files.TahoeLogFileIndex
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
+import org.apache.spark.sql.delta.util.FileNames
 import org.apache.hadoop.fs.{FileSystem, Path}
 
 import org.apache.spark.SparkException
@@ -28,15 +32,17 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.expressions.InSet
 import org.apache.spark.sql.catalyst.plans.logical.Filter
+import org.apache.spark.sql.execution.FileSourceScanExec
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.OPTIMIZER_METADATA_ONLY
 import org.apache.spark.sql.test.{SharedSparkSession, SQLTestUtils}
+import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.Utils
 
 class DeltaSuite extends QueryTest
-  with SharedSparkSession  with SQLTestUtils {
+  with SharedSparkSession  with SQLTestUtils
+  with DeltaSQLCommandTest {
 
   import testImplicits._
 
@@ -83,6 +89,37 @@ class DeltaSuite extends QueryTest
     }
   }
 
+  test("query with predicates should skip partitions") {
+    withTempDir { tempDir =>
+      val testPath = tempDir.getCanonicalPath
+
+      // Generate two files in two partitions
+      spark.range(2)
+        .withColumn("part", $"id" % 2)
+        .write
+        .format("delta")
+        .partitionBy("part")
+        .mode("append")
+        .save(testPath)
+
+      // Read only one partition
+      val query = spark.read.format("delta").load(testPath).where("part = 1")
+      val fileScans = query.queryExecution.executedPlan.collect {
+        case f: FileSourceScanExec => f
+      }
+
+      // Force the query to read files and generate metrics
+      query.queryExecution.executedPlan.execute().count()
+
+      // Verify only one file was read
+      assert(fileScans.size == 1)
+      val numFilesAferPartitionSkipping = fileScans.head.metrics.get("numFiles")
+      assert(numFilesAferPartitionSkipping.nonEmpty)
+      assert(numFilesAferPartitionSkipping.get.value == 1)
+      checkAnswer(query, Seq(Row(1, 1)))
+    }
+  }
+
   test("partition column location should not impact table schema") {
     val tableColumns = Seq("c1", "c2")
     for (partitionColumn <- tableColumns) {
@@ -108,12 +145,19 @@ class DeltaSuite extends QueryTest
     val fs = path.getFileSystem(spark.sessionState.newHadoopConf())
     fs.delete(path, true)
 
-    val e = intercept[FileNotFoundException] {
+    val e = intercept[AnalysisException] {
       withSQLConf(DeltaSQLConf.DELTA_ASYNC_UPDATE_STALENESS_TIME_LIMIT.key -> "0s") {
         checkAnswer(df, Row(1) :: Nil)
       }
     }.getMessage
-    assert(e.contains("No delta log found"))
+    assert(e.contains("The schema of your Delta table has changed"))
+    val e2 = intercept[AnalysisException] {
+      withSQLConf(DeltaSQLConf.DELTA_ASYNC_UPDATE_STALENESS_TIME_LIMIT.key -> "0s") {
+        // Define new DataFrame
+        spark.read.format("delta").load(tempDir.toString).collect()
+      }
+    }.getMessage
+    assert(e2.contains("is not a Delta table"))
   }
 
   test("append then read") {
@@ -421,7 +465,7 @@ class DeltaSuite extends QueryTest
           .show()
       }
 
-      assert(e.getMessage.contains("doesn't exist"))
+      assert(e.getMessage.contains("is not a Delta table"))
       assert(e.getMessage.contains(tempDir.getCanonicalPath))
 
       assert(!tempDir.exists())
@@ -494,17 +538,49 @@ class DeltaSuite extends QueryTest
     }
   }
 
+  test("support removing partitioning") {
+    withTempDir { tempDir =>
+      if (tempDir.exists()) {
+        assert(tempDir.delete())
+      }
+
+      spark.range(100).select('id, 'id % 4 as 'by4)
+        .write
+        .format("delta")
+        .partitionBy("by4")
+        .save(tempDir.toString)
+
+      val deltaLog = DeltaLog.forTable(spark, tempDir)
+      assert(deltaLog.snapshot.metadata.partitionColumns === Seq("by4"))
+
+      spark.read.format("delta").load(tempDir.toString).write
+        .option(DeltaOptions.OVERWRITE_SCHEMA_OPTION, "true")
+        .format("delta")
+        .mode(SaveMode.Overwrite)
+        .save(tempDir.toString)
+
+      assert(deltaLog.snapshot.metadata.partitionColumns === Nil)
+    }
+  }
+
   test("columns with commas as partition columns") {
     withTempDir { tempDir =>
       if (tempDir.exists()) {
         assert(tempDir.delete())
       }
 
-      spark.range(100).select('id, 'id % 4 as "by,4")
+      val dfw = spark.range(100).select('id, 'id % 4 as "by,4")
         .write
         .format("delta")
         .partitionBy("by,4")
-        .save(tempDir.toString)
+
+      val e = intercept[AnalysisException] {
+        dfw.save(tempDir.toString)
+      }
+      assert(e.getMessage.contains("invalid character(s)"))
+      withSQLConf(DeltaSQLConf.DELTA_PARTITION_COLUMN_CHECK_ENABLED.key -> "false") {
+        dfw.save(tempDir.toString)
+      }
 
       val files = spark.read.format("delta").load(tempDir.toString).inputFiles
 
@@ -556,22 +632,6 @@ class DeltaSuite extends QueryTest
           .save(tempDir.toString)
       }
       assert(e.getMessage.contains("incompatible"))
-    }
-  }
-
-  test("metadataOnly query") {
-    withSQLConf(OPTIMIZER_METADATA_ONLY.key -> "true") {
-      withTable("delta_test") {
-        Seq(1L -> "a").toDF("dataCol", "partCol")
-          .write
-          .mode(SaveMode.Overwrite)
-          .partitionBy("partCol")
-          .format("delta")
-          .saveAsTable("delta_test")
-        checkAnswer(
-          sql("select count(distinct partCol) FROM delta_test"),
-          Row(1))
-      }
     }
   }
 
@@ -659,7 +719,7 @@ class DeltaSuite extends QueryTest
     withTempDir { tempDir =>
       spark.range(10).write.format("delta").save(tempDir.toString)
       val deltaLog = DeltaLog.forTable(spark, tempDir)
-      val numParts = spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_SNAPSHOT_PARTITIONS)
+      val numParts = spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_SNAPSHOT_PARTITIONS).get
       assert(deltaLog.snapshot.state.rdd.getNumPartitions == numParts)
     }
   }
@@ -708,9 +768,7 @@ class DeltaSuite extends QueryTest
 
         // The file names are opaque. To identify which one we're deleting, we ensure that only one
         // append has 2 partitions, and give them the same value so we know what was deleted.
-        val inputFiles =
-          TahoeLogFileIndex(spark, deltaLog, new Path(tempDir.getCanonicalPath))
-            .inputFiles.toSeq
+        val inputFiles = TahoeLogFileIndex(spark, deltaLog).inputFiles.toSeq
         assert(inputFiles.size == 5)
 
         val filesToDelete = inputFiles.filter(_.split("/").last.startsWith("part-00001"))
@@ -742,9 +800,7 @@ class DeltaSuite extends QueryTest
 
         // The file names are opaque. To identify which one we're deleting, we ensure that only one
         // append has 2 partitions, and give them the same value so we know what was deleted.
-        val inputFiles =
-          TahoeLogFileIndex(spark, deltaLog, new Path(tempDir.getCanonicalPath))
-            .inputFiles.toSeq
+        val inputFiles = TahoeLogFileIndex(spark, deltaLog).inputFiles.toSeq
         assert(inputFiles.size == 5)
 
         val filesToCorrupt = inputFiles.filter(_.split("/").last.startsWith("part-00001"))
@@ -773,9 +829,7 @@ class DeltaSuite extends QueryTest
         Range(0, 10).foreach(n =>
           Seq(n).toDF().write.format("delta").mode("append").save(tempDir.toString))
 
-        val inputFiles =
-          TahoeLogFileIndex(spark, deltaLog, new Path(tempDir.getCanonicalPath))
-            .inputFiles.toSeq
+        val inputFiles = TahoeLogFileIndex(spark, deltaLog).inputFiles.toSeq
 
         val filesToDelete = inputFiles.take(4)
         filesToDelete.foreach { f =>
@@ -802,9 +856,7 @@ class DeltaSuite extends QueryTest
       Range(0, 10).foreach(n =>
         Seq(n).toDF().write.format("delta").mode("append").save(tempDir.toString))
 
-      val inputFiles =
-        TahoeLogFileIndex(spark, deltaLog, new Path(tempDir.getCanonicalPath))
-          .inputFiles.toSeq
+      val inputFiles = TahoeLogFileIndex(spark, deltaLog).inputFiles.toSeq
 
       val filesToDelete = inputFiles.take(4)
       filesToDelete.foreach { f =>
@@ -947,7 +999,7 @@ class DeltaSuite extends QueryTest
     val listener = new SparkListener {
       override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
         // Spark will always log a job start/end event even when the job does not launch any task.
-        if (jobStart.stageInfos.forall(_.numTasks > 0)) {
+        if (jobStart.stageInfos.exists(_.numTasks > 0)) {
           jobCount.incrementAndGet()
         }
       }
@@ -964,5 +1016,207 @@ class DeltaSuite extends QueryTest
     } finally {
       sparkContext.removeSparkListener(listener)
     }
+  }
+
+  def lastCommitInfo(dir: String): CommitInfo =
+    io.delta.tables.DeltaTable.forPath(spark, dir).history(1).as[CommitInfo].head
+
+  test("history includes user-defined metadata for DataFrame.Write API") {
+    val tempDir = Utils.createTempDir().toString
+    val df = Seq(2).toDF().write.format("delta").mode("overwrite")
+
+    df.option("userMetadata", "meta1")
+      .save(tempDir)
+
+    assert(lastCommitInfo(tempDir).userMetadata === Some("meta1"))
+
+    df.option("userMetadata", "meta2")
+      .save(tempDir)
+
+    assert(lastCommitInfo(tempDir).userMetadata === Some("meta2"))
+  }
+
+  test("history includes user-defined metadata for SQL API") {
+    val tempDir = Utils.createTempDir().toString
+    val tblName = "tblName"
+
+    withTable(tblName) {
+      withSQLConf(DeltaSQLConf.DELTA_USER_METADATA.key -> "meta1") {
+        spark.sql(s"CREATE TABLE $tblName (data STRING) USING delta LOCATION '$tempDir';")
+      }
+      assert(lastCommitInfo(tempDir).userMetadata === Some("meta1"))
+
+      withSQLConf(DeltaSQLConf.DELTA_USER_METADATA.key -> "meta2") {
+        spark.sql(s"INSERT INTO $tblName VALUES ('test');")
+      }
+      assert(lastCommitInfo(tempDir).userMetadata === Some("meta2"))
+
+      withSQLConf(DeltaSQLConf.DELTA_USER_METADATA.key -> "meta3") {
+        spark.sql(s"INSERT INTO $tblName VALUES ('test2');")
+      }
+      assert(lastCommitInfo(tempDir).userMetadata === Some("meta3"))
+    }
+  }
+
+  test("history includes user-defined metadata for DF.Write API and config setting") {
+    val tempDir = Utils.createTempDir().toString
+    val df = Seq(2).toDF().write.format("delta").mode("overwrite")
+
+    withSQLConf(DeltaSQLConf.DELTA_USER_METADATA.key -> "meta1") {
+      df.save(tempDir)
+    }
+    assert(lastCommitInfo(tempDir).userMetadata === Some("meta1"))
+
+    withSQLConf(DeltaSQLConf.DELTA_USER_METADATA.key -> "meta2") {
+      df.option("userMetadata", "optionMeta2")
+        .save(tempDir)
+    }
+    assert(lastCommitInfo(tempDir).userMetadata === Some("optionMeta2"))
+  }
+
+  test("history includes user-defined metadata for SQL + DF.Write API") {
+    val tempDir = Utils.createTempDir().toString
+    val df = Seq(2).toDF().write.format("delta").mode("overwrite")
+
+    // metadata given in `option` should beat config
+    withSQLConf(DeltaSQLConf.DELTA_USER_METADATA.key -> "meta1") {
+      df.option("userMetadata", "optionMeta1")
+        .save(tempDir)
+    }
+    assert(lastCommitInfo(tempDir).userMetadata === Some("optionMeta1"))
+
+    withSQLConf(DeltaSQLConf.DELTA_USER_METADATA.key -> "meta2") {
+      df.option("userMetadata", "optionMeta2")
+        .save(tempDir)
+    }
+    assert(lastCommitInfo(tempDir).userMetadata === Some("optionMeta2"))
+  }
+
+  test("lastCommitVersionInSession - init") {
+    spark.sessionState.conf.unsetConf(DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION)
+    withTempDir { tempDir =>
+
+      assert(spark.conf.get(DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION) === None)
+
+      Seq(1).toDF
+        .write
+        .format("delta")
+        .save(tempDir.getCanonicalPath)
+
+      assert(spark.conf.get(DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION) === Some(0))
+    }
+  }
+
+  test("lastCommitVersionInSession - SQL") {
+    spark.sessionState.conf.unsetConf(DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION)
+    withTempDir { tempDir =>
+
+      val k = DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION.key
+      assert(sql(s"SET $k").head().get(1) === "<undefined>")
+
+      Seq(1).toDF
+        .write
+        .format("delta")
+        .save(tempDir.getCanonicalPath)
+
+      assert(sql(s"SET $k").head().get(1) === "0")
+    }
+  }
+
+  test("lastCommitVersionInSession - SQL only") {
+    spark.sessionState.conf.unsetConf(DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION)
+    withTable("test_table") {
+      val k = DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION.key
+      assert(sql(s"SET $k").head().get(1) === "<undefined>")
+
+      sql("CREATE TABLE test_table USING delta AS SELECT * FROM range(10)")
+      assert(sql(s"SET $k").head().get(1) === "0")
+    }
+  }
+
+  test("lastCommitVersionInSession - CONVERT TO DELTA") {
+    withTempDir { tempDir =>
+      val path = tempDir.getCanonicalPath + "/table"
+      spark.range(10).write.format("parquet").save(path)
+      sql(s"CONVERT TO DELTA parquet.`$path`")
+
+      assert(spark.conf.get(DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION) === Some(0))
+    }
+  }
+
+  test("lastCommitVersionInSession - many writes") {
+    withTempDir { tempDir =>
+
+      for (i <- 0 until 10) {
+        Seq(i).toDF
+          .write
+          .mode("overwrite")
+          .format("delta")
+          .save(tempDir.getCanonicalPath)
+      }
+
+      Seq(10).toDF
+        .write
+        .format("delta")
+        .mode("append")
+        .save(tempDir.getCanonicalPath)
+
+      assert(spark.conf.get(DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION) === Some(10))
+    }
+  }
+
+  test("lastCommitVersionInSession - new thread writes") {
+    withTempDir { tempDir =>
+
+      Seq(1).toDF
+        .write
+        .format("delta")
+        .mode("overwrite")
+        .save(tempDir.getCanonicalPath)
+
+      val t = new Thread {
+        override def run(): Unit = {
+          Seq(2).toDF
+            .write
+            .format("delta")
+            .mode("overwrite")
+            .save(tempDir.getCanonicalPath)
+        }
+      }
+
+      t.start
+      t.join
+      assert(spark.conf.get(DeltaSQLConf.DELTA_LAST_COMMIT_VERSION_IN_SESSION) === Some(1))
+    }
+  }
+
+  test("An external write should be reflected during analysis of a path based query") {
+    val tempDir = Utils.createTempDir().toString
+    spark.range(10).coalesce(1).write.format("delta").mode("append").save(tempDir)
+    spark.range(10, 20).coalesce(1).write.format("delta").mode("append").save(tempDir)
+
+    val deltaLog = DeltaLog.forTable(spark, tempDir)
+    val snapshot = deltaLog.snapshot
+    val files = snapshot.allFiles.collect()
+
+    // Now make a commit that comes from an "external" writer that deletes existing data and
+    // changes the schema
+    val actions = Seq(
+      Protocol(),
+      snapshot.metadata.copy(schemaString = new StructType().add("data", "bigint").json)
+    ) ++ files.map(_.remove)
+    deltaLog.store.write(
+      FileNames.deltaFile(deltaLog.logPath, snapshot.version + 1),
+      actions.map(_.json).iterator)
+
+    deltaLog.store.write(
+      FileNames.deltaFile(deltaLog.logPath, snapshot.version + 2),
+      files.take(1).map(_.json).iterator)
+
+    // Since the column `data` doesn't exist in our old files, we read it as null.
+    checkAnswer(
+      spark.read.format("delta").load(tempDir),
+      Seq.fill(10)(Row(null))
+    )
   }
 }

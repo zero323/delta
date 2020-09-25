@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ import org.apache.spark.sql.execution.command.RunnableCommand
  *
  * Existing Table Semantics
  *  - The save mode will control how existing data is handled (i.e. overwrite, append, etc)
- *  - The schema will of the DataFrame will be checked and if there are new columns present
+ *  - The schema of the DataFrame will be checked and if there are new columns present
  *    they will be added to the tables schema. Conflicting columns (i.e. a INT, and a STRING)
  *    will result in an exception
  *  - The partition columns, if present are validated against the existing metadata. If not
@@ -63,7 +63,8 @@ case class WriteIntoDelta(
   override def run(sparkSession: SparkSession): Seq[Row] = {
     deltaLog.withNewTransaction { txn =>
       val actions = write(txn, sparkSession)
-      val operation = DeltaOperations.Write(mode, Option(partitionColumns), options.replaceWhere)
+      val operation = DeltaOperations.Write(mode, Option(partitionColumns),
+        options.replaceWhere, options.userMetadata)
       txn.commit(actions, operation)
     }
     Seq.empty

@@ -1,5 +1,5 @@
 #
-# Copyright 2019 Databricks, Inc.
+# Copyright (2020) The Delta Lake Project Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,36 +15,27 @@
 #
 
 import unittest
-import tempfile
-import shutil
 import os
 
-from pyspark.sql import SQLContext, Row, SparkSession
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.sql.functions import col, lit, expr
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 
-from delta.tables import *
-from delta.testing.utils import PySparkTestCase
+from delta.tables import DeltaTable
+from delta.testing.utils import DeltaTestCase
 
 
-class DeltaTableTests(PySparkTestCase):
-
-    def setUp(self):
-        super(DeltaTableTests, self).setUp()
-        self.sqlContext = SQLContext(self.sc)
-        self.spark = SparkSession(self.sc)
-        self.tempPath = tempfile.mkdtemp()
-        self.tempFile = os.path.join(self.tempPath, "tempFile")
-
-    def tearDown(self):
-        self.spark.stop()
-        shutil.rmtree(self.tempPath)
-        super(DeltaTableTests, self).tearDown()
+class DeltaTableTests(DeltaTestCase):
 
     def test_forPath(self):
         self.__writeDeltaTable([('a', 1), ('b', 2), ('c', 3)])
         dt = DeltaTable.forPath(self.spark, self.tempFile).toDF()
         self.__checkAnswer(dt, [('a', 1), ('b', 2), ('c', 3)])
+
+    def test_forName(self):
+        self.__writeAsTable([('a', 1), ('b', 2), ('c', 3)], "test")
+        df = DeltaTable.forName(self.spark, "test").toDF()
+        self.__checkAnswer(df, [('a', 1), ('b', 2), ('c', 3)])
 
     def test_alias_and_toDF(self):
         self.__writeDeltaTable([('a', 1), ('b', 2), ('c', 3)])
@@ -359,6 +350,43 @@ class DeltaTableTests(PySparkTestCase):
         self.assertEqual(DeltaTable.isDeltaTable(self.spark, self.tempFile), False)
         self.assertEqual(DeltaTable.isDeltaTable(self.spark, tempFile2), True)
 
+    def test_protocolUpgrade(self):
+        try:
+            self.spark.conf.set('spark.databricks.delta.minWriterVersion', '2')
+            self.spark.conf.set('spark.databricks.delta.minReaderVersion', '1')
+            self.__writeDeltaTable([('a', 1), ('b', 2), ('c', 3), ('d', 4)])
+            dt = DeltaTable.forPath(self.spark, self.tempFile)
+            dt.upgradeTableProtocol(1, 3)
+        finally:
+            self.spark.conf.unset('spark.databricks.delta.minWriterVersion')
+            self.spark.conf.unset('spark.databricks.delta.minReaderVersion')
+
+        # cannot downgrade once upgraded
+        failed = False
+        try:
+            dt.upgradeTableProtocol(1, 2)
+        except:
+            failed = True
+        self.assertTrue(failed, "The upgrade should have failed, because downgrades aren't allowed")
+
+        # bad args
+        with self.assertRaisesRegex(ValueError, "readerVersion"):
+            dt.upgradeTableProtocol("abc", 3)
+        with self.assertRaisesRegex(ValueError, "readerVersion"):
+            dt.upgradeTableProtocol([1], 3)
+        with self.assertRaisesRegex(ValueError, "readerVersion"):
+            dt.upgradeTableProtocol([], 3)
+        with self.assertRaisesRegex(ValueError, "readerVersion"):
+            dt.upgradeTableProtocol({}, 3)
+        with self.assertRaisesRegex(ValueError, "writerVersion"):
+            dt.upgradeTableProtocol(1, "abc")
+        with self.assertRaisesRegex(ValueError, "writerVersion"):
+            dt.upgradeTableProtocol(1, [3])
+        with self.assertRaisesRegex(ValueError, "writerVersion"):
+            dt.upgradeTableProtocol(1, [])
+        with self.assertRaisesRegex(ValueError, "writerVersion"):
+            dt.upgradeTableProtocol(1, {})
+
     def __checkAnswer(self, df, expectedAnswer, schema=["key", "value"]):
         if not expectedAnswer:
             self.assertEqual(df.count(), 0)
@@ -379,6 +407,10 @@ class DeltaTableTests(PySparkTestCase):
     def __writeDeltaTable(self, datalist):
         df = self.spark.createDataFrame(datalist, ["key", "value"])
         df.write.format("delta").save(self.tempFile)
+
+    def __writeAsTable(self, datalist, tblName):
+        df = self.spark.createDataFrame(datalist, ["key", "value"])
+        df.write.format("delta").saveAsTable(tblName)
 
     def __overwriteDeltaTable(self, datalist):
         df = self.spark.createDataFrame(datalist, ["key", "value"])

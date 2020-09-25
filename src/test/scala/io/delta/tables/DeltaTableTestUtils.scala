@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,14 @@
 package io.delta.tables
 
 import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.delta.catalog.DeltaTableV2
 
 import org.apache.spark.sql.DataFrame
 
 object DeltaTableTestUtils {
 
   /** A utility method to access the private constructor of [[DeltaTable]] in tests. */
-  def createTable(df: DataFrame, deltaLog: DeltaLog): DeltaTable = new DeltaTable(df, deltaLog)
+  def createTable(df: DataFrame, deltaLog: DeltaLog): DeltaTable = {
+    new DeltaTable(df, DeltaTableV2(df.sparkSession, deltaLog.dataPath))
+  }
 }

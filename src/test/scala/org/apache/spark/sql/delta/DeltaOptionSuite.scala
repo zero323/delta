@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ package org.apache.spark.sql.delta
 import org.apache.spark.sql.delta.actions.{Action, FileAction}
 import org.apache.spark.sql.delta.util.FileNames
 
-import org.apache.spark.SparkConf
 import org.apache.spark.sql.{AnalysisException, QueryTest}
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.util.Utils
@@ -115,7 +114,6 @@ class DeltaOptionSuite extends QueryTest
 
       // Overwriting the schema of the existing table while having dataChange as false.
       val e3 = intercept[AnalysisException] {
-        val df = spark.read.format("delta").load(tempDir.getAbsolutePath)
         spark.range(50)
           .withColumn("id3", 'id + 1)
           .write

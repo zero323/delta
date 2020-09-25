@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import scala.concurrent.duration._
 import scala.language.implicitConversions
 
 import org.apache.spark.sql.delta.DeltaHistoryManager.BufferingLogDeletionIterator
+import org.apache.spark.sql.delta.DeltaTestUtils.OptimisticTxnTestHelper
 import org.apache.spark.sql.delta.actions.AddFile
 import org.apache.spark.sql.delta.util.FileNames
 import org.apache.commons.lang3.time.DateUtils
@@ -66,7 +67,7 @@ class DeltaTimeTravelSuite extends QueryTest
     var startVersion = deltaLog.snapshot.version + 1
     commits.foreach { ts =>
       val action = AddFile(startVersion.toString, Map.empty, 10L, startVersion, dataChange = true)
-      deltaLog.startTransaction().commit(Seq(action), DeltaOperations.ManualUpdate)
+      deltaLog.startTransaction().commitManually(action)
       modifyCommitTimestamp(deltaLog, startVersion, ts)
       startVersion += 1
     }
@@ -149,10 +150,10 @@ class DeltaTimeTravelSuite extends QueryTest
     val history = new DeltaHistoryManager(deltaLog)
     assert(history.getActiveCommitAtTime(start + 15.seconds, false).version === 1)
 
-    assert(new File(FileNames.deltaFile(deltaLog.logPath, 0L).toUri).delete())
     val commits2 = history.getHistory(Some(10))
-    assert(commits2.last.version === Some(1))
+    assert(commits2.last.version === Some(0))
 
+    assert(new File(FileNames.deltaFile(deltaLog.logPath, 0L).toUri).delete())
     val e = intercept[AnalysisException] {
       history.getActiveCommitAtTime(start + 15.seconds, false).version
     }

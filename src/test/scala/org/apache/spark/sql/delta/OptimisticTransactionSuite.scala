@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,13 @@
 
 package org.apache.spark.sql.delta
 
-import java.util.ConcurrentModificationException
-
-import org.apache.spark.sql.delta.DeltaOperations.{Delete, ManualUpdate, Truncate}
+import org.apache.spark.sql.delta.DeltaOperations.ManualUpdate
+import org.apache.spark.sql.delta.DeltaTestUtils.OptimisticTxnTestHelper
 import org.apache.spark.sql.delta.actions.{Action, AddFile, FileAction, Metadata, RemoveFile, SetTransaction}
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.sql.{QueryTest, Row}
-import org.apache.spark.sql.execution.FileSourceScanExec
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
 
@@ -37,8 +36,8 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
   test("block append against metadata change") {
     withTempDir { tempDir =>
       val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
-      // Initialize the log. ManualUpdate is just a no-op placeholder.
-      log.startTransaction().commit(Nil, ManualUpdate)
+      // Initialize the log.
+      log.startTransaction().commitManually()
 
       val txn = log.startTransaction()
       val winningTxn = log.startTransaction()
@@ -52,8 +51,8 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
   test("block read+append against append") {
     withTempDir { tempDir =>
       val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
-      // Initialize the log. ManualUpdate is just a no-op placeholder.
-      log.startTransaction().commit(Metadata() :: Nil, ManualUpdate)
+      // Initialize the log.
+      log.startTransaction().commitManually()
 
       val txn = log.startTransaction()
       // reads the table
@@ -70,8 +69,8 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
   test("allow blind-append against any data change") {
     withTempDir { tempDir =>
       val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
-      // Initialize the log and add data. ManualUpdate is just a no-op placeholder.
-      log.startTransaction().commit(addA :: Nil, ManualUpdate)
+      // Initialize the log and add data.
+      log.startTransaction().commitManually(addA)
 
       val txn = log.startTransaction()
       val winningTxn = log.startTransaction()
@@ -85,7 +84,7 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
     withTempDir { tempDir =>
       val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
       // Initialize the log and add data. ManualUpdate is just a no-op placeholder.
-      log.startTransaction().commit(addA :: Nil, ManualUpdate)
+      log.startTransaction().commitManually(addA)
 
       val txn = log.startTransaction()
       txn.filterFiles()
@@ -640,14 +639,15 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
       partitionCols: Seq[String] = "part" :: Nil)(
       test: DeltaLog => Unit): Unit = {
 
-    val schema = new StructType(partitionCols.map(p => new StructField(p, StringType)).toArray)
-    var actionWithMetaData =
+    val schema = StructType(partitionCols.map(p => StructField(p, StringType)).toArray)
+    val actionWithMetaData =
       actions :+ Metadata(partitionColumns = partitionCols, schemaString = schema.json)
 
     withTempDir { tempDir =>
       val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
       // Initialize the log and add data. ManualUpdate is just a no-op placeholder.
-      log.startTransaction().commit(actionWithMetaData, ManualUpdate)
+      log.startTransaction().commit(Seq(Metadata(partitionColumns = partitionCols)), ManualUpdate)
+      log.startTransaction().commitManually(actionWithMetaData: _*)
       test(log)
     }
   }
@@ -655,8 +655,8 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
   test("allow concurrent set-txns with different app ids") {
     withTempDir { tempDir =>
       val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
-      // Initialize the log and add data. ManualUpdate is just a no-op placeholder.
-      log.startTransaction().commit(Nil, ManualUpdate)
+      // Initialize the log.
+      log.startTransaction().commitManually()
 
       val txn = log.startTransaction()
       txn.txnVersion("t1")
@@ -671,8 +671,8 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
   test("block concurrent set-txns with the same app id") {
     withTempDir { tempDir =>
       val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
-      // Initialize the log and add data. ManualUpdate is just a no-op placeholder.
-      log.startTransaction().commit(Nil, ManualUpdate)
+      // Initialize the log.
+      log.startTransaction().commitManually()
 
       val txn = log.startTransaction()
       txn.txnVersion("t1")
@@ -685,25 +685,56 @@ class OptimisticTransactionSuite extends QueryTest with SharedSparkSession {
     }
   }
 
-  test("query with predicates should skip partitions") {
+  test("initial commit without metadata should fail") {
     withTempDir { tempDir =>
-      val testPath = tempDir.getCanonicalPath
-      spark.range(2)
-        .map(_.toInt)
-        .withColumn("part", $"value" % 2)
-        .write
-        .format("delta")
-        .partitionBy("part")
-        .mode("append")
-        .save(testPath)
-
-      val query = spark.read.format("delta").load(testPath).where("part = 1")
-      val fileScans = query.queryExecution.executedPlan.collect {
-        case f: FileSourceScanExec => f
+      val log = DeltaLog(spark, new Path(tempDir.getCanonicalPath))
+      val txn = log.startTransaction()
+      withSQLConf(DeltaSQLConf.DELTA_COMMIT_VALIDATION_ENABLED.key -> "true") {
+        val e = intercept[IllegalStateException] {
+          txn.commit(Nil, ManualUpdate)
+        }
+        assert(e.getMessage === DeltaErrors.metadataAbsentException().getMessage)
       }
-      assert(fileScans.size == 1)
-      assert(fileScans.head.metadata.get("PartitionCount").contains("1"))
-      checkAnswer(query, Seq(Row(1, 1)))
+
+      // Try with commit validation turned off
+      withSQLConf(DeltaSQLConf.DELTA_STATE_RECONSTRUCTION_VALIDATION_ENABLED.key -> "false",
+          DeltaSQLConf.DELTA_COMMIT_VALIDATION_ENABLED.key -> "false") {
+        txn.commit(Nil, ManualUpdate)
+        assert(log.update().version === 0)
+      }
+    }
+  }
+
+  test("initial commit with multiple metadata actions should fail") {
+    withTempDir { tempDir =>
+      val log = DeltaLog(spark, new Path(tempDir.getAbsolutePath))
+      val txn = log.startTransaction()
+      val e = intercept[AssertionError] {
+        txn.commit(Seq(Metadata(), Metadata()), ManualUpdate)
+      }
+      assert(e.getMessage.contains("Cannot change the metadata more than once in a transaction."))
+    }
+  }
+
+  test("AddFile with different partition schema compared to metadata should fail") {
+    withTempDir { tempDir =>
+      val log = DeltaLog(spark, new Path(tempDir.getAbsolutePath))
+      log.startTransaction().commit(Seq(Metadata(partitionColumns = Seq("col2"))), ManualUpdate)
+      withSQLConf(DeltaSQLConf.DELTA_COMMIT_VALIDATION_ENABLED.key -> "true") {
+        val e = intercept[IllegalStateException] {
+          log.startTransaction().commit(Seq(AddFile(
+            log.dataPath.toString, Map("col3" -> "1"), 12322, 0L, true, null, null)), ManualUpdate)
+        }
+        assert(e.getMessage === DeltaErrors.addFilePartitioningMismatchException(
+          Seq("col3"), Seq("col2")).getMessage)
+      }
+      // Try with commit validation turned off
+      withSQLConf(DeltaSQLConf.DELTA_STATE_RECONSTRUCTION_VALIDATION_ENABLED.key -> "false",
+        DeltaSQLConf.DELTA_COMMIT_VALIDATION_ENABLED.key -> "false") {
+        log.startTransaction().commit(Seq(AddFile(
+          log.dataPath.toString, Map("col3" -> "1"), 12322, 0L, true, null, null)), ManualUpdate)
+        assert(log.update().version === 1)
+      }
     }
   }
 }

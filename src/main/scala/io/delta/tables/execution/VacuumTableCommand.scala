@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,15 +42,18 @@ case class VacuumTableCommand(
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
     val pathToVacuum =
-      new Path(if (table.nonEmpty) {
+      if (path.nonEmpty) {
+        new Path(path.get)
+      } else if (table.nonEmpty) {
         DeltaTableIdentifier(sparkSession, table.get) match {
-          case Some(id) if id.path.isDefined => id.path.get
-          case Some(id) => throw DeltaErrors.tableNotSupportedException("VACUUM")
-          case None => throw DeltaErrors.notADeltaTableException("VACUUM")
+          case Some(id) if id.path.nonEmpty =>
+            new Path(id.path.get)
+          case _ =>
+            new Path(sparkSession.sessionState.catalog.getTableMetadata(table.get).location)
         }
       } else {
-        path.get
-      })
+        throw DeltaErrors.missingTableIdentifierException("VACUUM")
+      }
     val baseDeltaPath = DeltaTableUtils.findDeltaTableRoot(sparkSession, pathToVacuum)
     if (baseDeltaPath.isDefined) {
       if (baseDeltaPath.get != pathToVacuum) {

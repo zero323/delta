@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import java.io.File
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOptions}
 import org.apache.spark.sql.delta.actions.SingleAction
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import org.apache.spark.sql.delta.util.{FileNames, JsonUtils}
 
 import org.apache.spark.SparkConf
@@ -43,7 +44,6 @@ case class SaveWithPath(path: String = null) extends SaveOperation {
   }
 }
 
-// Not supported yet
 case class SaveAsTable(tableName: String) extends SaveOperation {
   override def apply(dfw: DataFrameWriter[_]): Unit = dfw.saveAsTable(tableName)
 }
@@ -250,6 +250,19 @@ trait AppendSaveModeTests extends BatchWriterTest {
             .partitionBy("a", "A")
             .option(DeltaOptions.MERGE_SCHEMA_OPTION, "true").append(dir)
         }
+      }
+    }
+  }
+
+  equivalenceTest("ensure schema mismatch error message contains table ID") {
+    disableAutoMigration {
+      withTempDir { dir =>
+        spark.range(10).write.append(dir)
+        val e = intercept[AnalysisException] {
+          spark.range(10).withColumn("part", 'id + 1).write.append(dir)
+        }
+        assert(e.getMessage.contains("schema mismatch detected"))
+        assert(e.getMessage.contains(s"Table ID: ${DeltaLog.forTable(spark, dir).tableId}"))
       }
     }
   }
@@ -849,6 +862,13 @@ class SchemaEnforcementWithPathSuite extends AppendSaveModeTests with OverwriteS
   override val saveOperation = SaveWithPath()
 }
 
+class SchemaEnforcementWithTableSuite
+  extends AppendSaveModeTests
+  with OverwriteSaveModeTests
+  with DeltaSQLCommandTest {
+
+  override val saveOperation = SaveAsTable("delta_schema_test")
+}
 
 class SchemaEnforcementStreamingSuite
   extends AppendOutputModeTests

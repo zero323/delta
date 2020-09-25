@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,12 @@ package org.apache.spark.sql.delta
 
 import java.util.Locale
 
+import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import io.delta.tables.DeltaTableTestUtils
 
 import org.apache.spark.sql.{functions, Row}
 
-class UpdateScalaSuite extends UpdateSuiteBase {
+class UpdateScalaSuite extends UpdateSuiteBase  with DeltaSQLCommandTest {
 
   import testImplicits._
 

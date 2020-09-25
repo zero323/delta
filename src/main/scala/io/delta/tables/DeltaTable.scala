@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,12 @@ package io.delta.tables
 import scala.collection.JavaConverters._
 
 import org.apache.spark.sql.delta._
+import org.apache.spark.sql.delta.actions.Protocol
+import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import io.delta.tables.execution._
 import org.apache.hadoop.fs.Path
 
-import org.apache.spark.annotation.InterfaceStability._
+import org.apache.spark.annotation._
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.types.StructType
@@ -39,8 +41,28 @@ import org.apache.spark.sql.types.StructType
  * @since 0.3.0
  */
 @Evolving
-class DeltaTable private[tables](df: Dataset[Row], deltaLog: DeltaLog)
-  extends DeltaTableOperations {
+class DeltaTable private[tables](
+    @transient private val _df: Dataset[Row],
+    @transient private val table: DeltaTableV2)
+  extends DeltaTableOperations with Serializable {
+
+  protected def deltaLog: DeltaLog = {
+    /** Assert the codes run in the driver. */
+    if (table == null) {
+      throw new IllegalStateException("DeltaTable cannot be used in executors")
+    }
+
+    table.deltaLog
+  }
+
+  protected def df: Dataset[Row] = {
+    /** Assert the codes run in the driver. */
+    if (_df == null) {
+      throw new IllegalStateException("DeltaTable cannot be used in executors")
+    }
+
+    _df
+  }
 
   /**
    * :: Evolving ::
@@ -51,7 +73,7 @@ class DeltaTable private[tables](df: Dataset[Row], deltaLog: DeltaLog)
    * @since 0.3.0
    */
   @Evolving
-  def as(alias: String): DeltaTable = new DeltaTable(df.as(alias), deltaLog)
+  def as(alias: String): DeltaTable = new DeltaTable(df.as(alias), table)
 
   /**
    * :: Evolving ::
@@ -501,6 +523,23 @@ class DeltaTable private[tables](df: Dataset[Row], deltaLog: DeltaLog)
   def merge(source: DataFrame, condition: Column): DeltaMergeBuilder = {
     DeltaMergeBuilder(this, source, condition)
   }
+
+  /**
+   * :: Evolving ::
+   *
+   * Updates the protocol version of the table to leverage new features. Upgrading the reader
+   * version will prevent all clients that have an older version of Delta Lake from accessing this
+   * table. Upgrading the writer version will prevent older versions of Delta Lake to write to this
+   * table. The reader or writer version cannot be downgraded.
+   *
+   * See online documentation and Delta's protocol specification at PROTOCOL.md for more details.
+   *
+   * @since 0.8.0
+   */
+  @Evolving
+  def upgradeTableProtocol(readerVersion: Int, writerVersion: Int): Unit = {
+    deltaLog.upgradeProtocol(Protocol(readerVersion, writerVersion))
+  }
 }
 
 /**
@@ -631,11 +670,41 @@ object DeltaTable {
    */
   @Evolving
   def forPath(sparkSession: SparkSession, path: String): DeltaTable = {
-    if (DeltaTableUtils.isDeltaTable(sparkSession, new Path(path))) {
+    val hdpPath = new Path(path)
+    if (DeltaTableUtils.isDeltaTable(sparkSession, hdpPath)) {
       new DeltaTable(sparkSession.read.format("delta").load(path),
-        DeltaLog.forTable(sparkSession, path))
+        DeltaTableV2(sparkSession, hdpPath))
     } else {
       throw DeltaErrors.notADeltaTableException(DeltaTableIdentifier(path = Some(path)))
+    }
+  }
+
+  /**
+   * Create a DeltaTable using the given table or view name using the given SparkSession.
+   *
+   * Note: This uses the active SparkSession in the current thread to read the table data. Hence,
+   * this throws error if active SparkSession has not been set, that is,
+   * `SparkSession.getActiveSession()` is empty.
+   */
+  def forName(tableOrViewName: String): DeltaTable = {
+    val sparkSession = SparkSession.getActiveSession.getOrElse {
+      throw new IllegalArgumentException("Could not find active SparkSession")
+    }
+    forName(sparkSession, tableOrViewName)
+  }
+
+  /**
+   * Create a DeltaTable using the given table or view name using the given SparkSession.
+   */
+  def forName(sparkSession: SparkSession, tableName: String): DeltaTable = {
+    val tableId = sparkSession.sessionState.sqlParser.parseTableIdentifier(tableName)
+    if (DeltaTableUtils.isDeltaTable(sparkSession, tableId)) {
+      val tbl = sparkSession.sessionState.catalog.getTableMetadata(tableId)
+      new DeltaTable(
+        sparkSession.table(tableName),
+        DeltaTableV2(sparkSession, new Path(tbl.location), Some(tbl), Some(tableName)))
+    } else {
+      throw DeltaErrors.notADeltaTableException(DeltaTableIdentifier(table = Some(tableId)))
     }
   }
 

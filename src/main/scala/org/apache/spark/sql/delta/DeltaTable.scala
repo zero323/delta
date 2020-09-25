@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,7 +54,8 @@ object DeltaTable {
  */
 object DeltaFullTable {
   def unapply(a: LogicalPlan): Option[TahoeLogFileIndex] = a match {
-    case PhysicalOperation(_, filters, DeltaTable(index: TahoeLogFileIndex)) =>
+    case PhysicalOperation(_, filters, lr @ DeltaTable(index: TahoeLogFileIndex)) =>
+      if (index.deltaLog.snapshot.version < 0) return None
       if (index.partitionFilters.isEmpty && index.versionToUse.isEmpty && filters.isEmpty) {
         Some(index)
       } else if (index.versionToUse.nonEmpty) {
@@ -65,6 +66,8 @@ object DeltaFullTable {
         throw new AnalysisException(
           s"Expect a full scan of Delta sources, but found a partial scan. path:${index.path}")
       }
+    // Convert V2 relations to V1 and perform the check
+    case DeltaRelation(lr) => unapply(lr)
     case _ =>
       None
   }
@@ -146,7 +149,7 @@ object DeltaTableUtils extends PredicateHelper
    * @param tableIdent the provided table or path
    * @return whether or not the provided TableIdentifier can specify a path for parquet or delta
    */
-  private def isValidPath(tableIdent: TableIdentifier): Boolean = {
+  def isValidPath(tableIdent: TableIdentifier): Boolean = {
     // If db doesnt exist or db is called delta/tahoe then check if path exists
     DeltaSourceUtils.isDeltaDataSourceName(tableIdent.database.getOrElse("")) &&
       new Path(tableIdent.table).isAbsolute
@@ -219,7 +222,7 @@ object DeltaTableUtils extends PredicateHelper
    * Check if condition involves a subquery expression.
    */
   def containsSubquery(condition: Expression): Boolean = {
-    condition.find(_.isInstanceOf[SubqueryExpression]).isDefined
+    SubqueryExpression.hasSubquery(condition)
   }
 
   /**

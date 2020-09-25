@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,14 +36,13 @@ import org.apache.spark.sql.delta.storage.LogStoreProvider
 import com.google.common.cache.{CacheBuilder, RemovalListener, RemovalNotification}
 import org.apache.hadoop.fs.Path
 
-import org.apache.spark.SparkContext
 import org.apache.spark.sql._
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{Resolver, UnresolvedAttribute}
-import org.apache.spark.sql.catalyst.expressions.{And, Attribute, Cast, Expression, In, InSet, Literal}
+import org.apache.spark.sql.catalyst.catalog.CatalogTable
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, Cast, Expression, Literal}
 import org.apache.spark.sql.catalyst.plans.logical.AnalysisHelper
 import org.apache.spark.sql.execution.datasources._
-import org.apache.spark.sql.execution.datasources.json.JsonFileFormat
-import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.sources.{BaseRelation, InsertableRelation}
 import org.apache.spark.sql.types.{StructField, StructType}
 import org.apache.spark.util.{Clock, SystemClock, ThreadUtils}
@@ -63,7 +62,8 @@ class DeltaLog private(
   extends Checkpoints
   with MetadataCleanup
   with LogStoreProvider
-  with VerifyChecksum {
+  with SnapshotManagement
+  with ReadChecksum {
 
   import org.apache.spark.sql.delta.util.FileNames._
 
@@ -71,18 +71,16 @@ class DeltaLog private(
   private lazy implicit val _clock = clock
 
   @volatile private[delta] var asyncUpdateTask: Future[Unit] = _
-  /** The timestamp when the last successful update action is finished. */
-  @volatile private var lastUpdateTimestamp = -1L
 
   protected def spark = SparkSession.active
 
   /** Used to read and write physical log files and checkpoints. */
-  val store = createLogStore(spark)
+  lazy val store = createLogStore(spark)
   /** Direct access to the underlying storage system. */
-  private[delta] val fs = logPath.getFileSystem(spark.sessionState.newHadoopConf)
+  private[delta] lazy val fs = logPath.getFileSystem(spark.sessionState.newHadoopConf)
 
   /** Use ReentrantLock to allow us to call `lockInterruptibly` */
-  private val deltaLogLock = new ReentrantLock()
+  protected val deltaLogLock = new ReentrantLock()
 
   /** Delta History Manager containing version and commit history. */
   lazy val history = new DeltaHistoryManager(
@@ -133,70 +131,15 @@ class DeltaLog private(
   /** The unique identifier for this table. */
   def tableId: String = metadata.id
 
-  /* ------------------ *
-   |  State Management  |
-   * ------------------ */
-
-  @volatile private var currentSnapshot: Snapshot = lastCheckpoint.map { c =>
-    val checkpointFiles = c.parts
-      .map(p => checkpointFileWithParts(logPath, c.version, p))
-      .getOrElse(Seq(checkpointFileSingular(logPath, c.version)))
-    val deltas = store.listFrom(deltaFile(logPath, c.version + 1))
-      .filter(f => isDeltaFile(f.getPath))
-      .toArray
-    val deltaVersions = deltas.map(f => deltaVersion(f.getPath))
-    verifyDeltaVersions(deltaVersions)
-    val newVersion = deltaVersions.lastOption.getOrElse(c.version)
-    logInfo(s"Loading version $newVersion starting from checkpoint ${c.version}")
-    try {
-      val deltaIndex = DeltaLogFileIndex(DeltaLog.COMMIT_FILE_FORMAT, deltas)
-      val checkpointIndex = DeltaLogFileIndex(DeltaLog.CHECKPOINT_FILE_FORMAT, fs, checkpointFiles)
-      val snapshot = new Snapshot(
-        logPath,
-        newVersion,
-        None,
-        checkpointIndex :: deltaIndex :: Nil,
-        minFileRetentionTimestamp,
-        this,
-        // we don't want to make an additional RPC here to get commit timestamps when "deltas" is
-        // empty. The next "update" call will take care of that if there are delta files.
-        deltas.lastOption.map(_.getModificationTime).getOrElse(-1L))
-
-      validateChecksum(snapshot)
-      lastUpdateTimestamp = clock.getTimeMillis()
-      snapshot
-    } catch {
-      case e: FileNotFoundException
-          if Option(e.getMessage).exists(_.contains("parquet does not exist")) =>
-        recordDeltaEvent(this, "delta.checkpoint.error.partial")
-        throw DeltaErrors.missingPartFilesException(c, e)
-      case e: AnalysisException if Option(e.getMessage).exists(_.contains("Path does not exist")) =>
-        recordDeltaEvent(this, "delta.checkpoint.error.partial")
-        throw DeltaErrors.missingPartFilesException(c, e)
-    }
-  }.getOrElse {
-    new InitialSnapshot(logPath, this, Metadata())
-  }
-
-  if (currentSnapshot.version == -1) {
-    // No checkpoint exists. Call "update" to load delta files.
-    update()
-  }
-
   /**
-   * Verify the versions are contiguous.
+   * Combines the tableId with the path of the table to ensure uniqueness. Normally `tableId`
+   * should be globally unique, but nothing stops users from copying a Delta table directly to
+   * a separate location, where the transaction log is copied directly, causing the tableIds to
+   * match. When users mutate the copied table, and then try to perform some checks joining the
+   * two tables, optimizations that depend on `tableId` alone may not be correct. Hence we use a
+   * composite id.
    */
-  private def verifyDeltaVersions(versions: Array[Long]): Unit = {
-    // Turn this to a vector so that we can compare it with a range.
-    val deltaVersions = versions.toVector
-    if (deltaVersions.nonEmpty &&
-      (deltaVersions.head to deltaVersions.last) != deltaVersions) {
-      throw new IllegalStateException(s"versions ($deltaVersions) are not contiguous")
-    }
-  }
-
-  /** Returns the current snapshot. Note this does not automatically `update()`. */
-  def snapshot: Snapshot = currentSnapshot
+  private[delta] def compositeId: (String, Path) = tableId -> dataPath
 
   /**
    * Run `body` inside `deltaLogLock` lock using `lockInterruptibly` so that the thread can be
@@ -210,159 +153,6 @@ class DeltaLog private(
       deltaLogLock.unlock()
     }
   }
-
-  /** Checks if the snapshot of the table has surpassed our allowed staleness. */
-  private def isSnapshotStale: Boolean = {
-    val stalenessLimit = spark.sessionState.conf.getConf(
-      DeltaSQLConf.DELTA_ASYNC_UPDATE_STALENESS_TIME_LIMIT)
-    stalenessLimit == 0L || lastUpdateTimestamp < 0 ||
-      clock.getTimeMillis() - lastUpdateTimestamp >= stalenessLimit
-  }
-
-  /**
-   * Update ActionLog by applying the new delta files if any.
-   *
-   * @param stalenessAcceptable Whether we can accept working with a stale version of the table. If
-   *                            the table has surpassed our staleness tolerance, we will update to
-   *                            the latest state of the table synchronously. If staleness is
-   *                            acceptable, and the table hasn't passed the staleness tolerance, we
-   *                            will kick off a job in the background to update the table state,
-   *                            and can return a stale snapshot in the meantime.
-   */
-  def update(stalenessAcceptable: Boolean = false): Snapshot = {
-    val doAsync = stalenessAcceptable && !isSnapshotStale
-    if (!doAsync) {
-      lockInterruptibly {
-        updateInternal(isAsync = false)
-      }
-    } else {
-      if (asyncUpdateTask == null || asyncUpdateTask.isCompleted) {
-        val jobGroup = spark.sparkContext.getLocalProperty(SparkContext.SPARK_JOB_GROUP_ID)
-        asyncUpdateTask = Future[Unit] {
-          spark.sparkContext.setLocalProperty("spark.scheduler.pool", "deltaStateUpdatePool")
-          spark.sparkContext.setJobGroup(
-            jobGroup,
-            s"Updating state of Delta table at ${currentSnapshot.path}",
-            interruptOnCancel = true)
-          tryUpdate(isAsync = true)
-        }(DeltaLog.deltaLogAsyncUpdateThreadPool)
-      }
-      currentSnapshot
-    }
-  }
-
-  /**
-   * Try to update ActionLog. If another thread is updating ActionLog, then this method returns
-   * at once and return the current snapshot. The return snapshot may be stale.
-   */
-  def tryUpdate(isAsync: Boolean = false): Snapshot = {
-    if (deltaLogLock.tryLock()) {
-      try {
-        updateInternal(isAsync)
-      } finally {
-        deltaLogLock.unlock()
-      }
-    } else {
-      currentSnapshot
-    }
-  }
-
-  /**
-   * Queries the store for new delta files and applies them to the current state.
-   * Note: the caller should hold `deltaLogLock` before calling this method.
-   */
-  private def updateInternal(isAsync: Boolean): Snapshot =
-    recordDeltaOperation(this, "delta.log.update", Map(TAG_ASYNC -> isAsync.toString)) {
-    withStatusCode("DELTA", "Updating the Delta table's state") {
-      try {
-        val newFiles = store
-          // List from the current version since we want to get the checkpoint file for the current
-          // version
-          .listFrom(checkpointPrefix(logPath, math.max(currentSnapshot.version, 0L)))
-          // Pick up checkpoint files not older than the current version and delta files newer than
-          // the current version
-          .filter { file =>
-            isCheckpointFile(file.getPath) ||
-              (isDeltaFile(file.getPath) && deltaVersion(file.getPath) > currentSnapshot.version)
-        }.toArray
-
-        val (checkpoints, deltas) = newFiles.partition(f => isCheckpointFile(f.getPath))
-        if (deltas.isEmpty) {
-          lastUpdateTimestamp = clock.getTimeMillis()
-          return currentSnapshot
-        }
-
-        val deltaVersions = deltas.map(f => deltaVersion(f.getPath))
-        verifyDeltaVersions(deltaVersions)
-        val lastChkpoint = lastCheckpoint.map(CheckpointInstance.apply)
-            .getOrElse(CheckpointInstance.MaxValue)
-        val checkpointFiles = checkpoints.map(f => CheckpointInstance(f.getPath))
-        val newCheckpoint = getLatestCompleteCheckpointFromList(checkpointFiles, lastChkpoint)
-        val newSnapshot = if (newCheckpoint.isDefined) {
-          // If there is a new checkpoint, start new lineage there.
-          val newCheckpointVersion = newCheckpoint.get.version
-          assert(
-            newCheckpointVersion >= currentSnapshot.version,
-            s"Attempting to load a checkpoint($newCheckpointVersion) " +
-                s"older than current version (${currentSnapshot.version})")
-          val newCheckpointFiles = newCheckpoint.get.getCorrespondingFiles(logPath)
-
-          val newVersion = deltaVersions.last
-
-          val deltaIndex = DeltaLogFileIndex(DeltaLog.COMMIT_FILE_FORMAT, deltas)
-          val checkpointIndex =
-            DeltaLogFileIndex(DeltaLog.CHECKPOINT_FILE_FORMAT, fs, newCheckpointFiles)
-
-          logInfo(s"Loading version $newVersion starting from checkpoint $newCheckpointVersion")
-
-          new Snapshot(
-            logPath,
-            newVersion,
-            None,
-            checkpointIndex :: deltaIndex :: Nil,
-            minFileRetentionTimestamp,
-            this,
-            deltas.last.getModificationTime)
-        } else {
-          // If there is no new checkpoint, just apply the deltas to the existing state.
-          assert(currentSnapshot.version + 1 == deltaVersions.head,
-            s"versions in [${currentSnapshot.version + 1}, ${deltaVersions.head}) are missing")
-          if (currentSnapshot.lineageLength >= maxSnapshotLineageLength) {
-            // Load Snapshot from scratch to avoid StackOverflowError
-            getSnapshotAt(deltaVersions.last, Some(deltas.last.getModificationTime))
-          } else {
-            val deltaIndex = DeltaLogFileIndex(DeltaLog.COMMIT_FILE_FORMAT, deltas)
-            new Snapshot(
-              logPath,
-              deltaVersions.last,
-              Some(currentSnapshot.state),
-              deltaIndex :: Nil,
-              minFileRetentionTimestamp,
-              this,
-              deltas.last.getModificationTime,
-              lineageLength = currentSnapshot.lineageLength + 1)
-          }
-        }
-        validateChecksum(newSnapshot)
-        currentSnapshot.uncache()
-        currentSnapshot = newSnapshot
-      } catch {
-        case f: FileNotFoundException =>
-          val message = s"No delta log found for the Delta table at $logPath"
-          logInfo(message)
-          // When the state is empty, this is expected. The log will be lazily created when needed.
-          // When the state is not empty, it's a real issue and we can't continue to execution.
-          if (currentSnapshot.version != -1) {
-            val e = new FileNotFoundException(message)
-            e.setStackTrace(f.getStackTrace)
-            throw e
-          }
-      }
-      lastUpdateTimestamp = clock.getTimeMillis()
-      currentSnapshot
-    }
-  }
-
 
   /* ------------------ *
    |  Delta Management  |
@@ -446,17 +236,6 @@ class DeltaLog private(
    |  Protocol validation  |
    * --------------------- */
 
-  private def oldProtocolMessage(protocol: Protocol): String =
-    s"WARNING: The Delta Lake table at $dataPath has version " +
-      s"${protocol.simpleString}, but the latest version is " +
-      s"${Protocol().simpleString}. To take advantage of the latest features and bug fixes, " +
-      "we recommend that you upgrade the table.\n" +
-      "First update all clusters that use this table to the latest version of Databricks " +
-      "Runtime, and then run the following command in a notebook:\n" +
-      "'%scala com.databricks.delta.Delta.upgradeTable(\"" + s"$dataPath" + "\")'\n\n" +
-      "For more information about Delta Lake table versions, see " +
-      s"${DeltaErrors.baseDocsPath(spark)}/delta/versioning.html"
-
   /**
    * If the given `protocol` is older than that of the client.
    */
@@ -479,11 +258,6 @@ class DeltaLog private(
           "minReaderVersion" -> protocol.minReaderVersion))
       throw new InvalidProtocolVersionException
     }
-
-    if (isProtocolOld(protocol)) {
-      recordDeltaEvent(this, "delta.protocol.warning")
-      logConsole(oldProtocolMessage(protocol))
-    }
   }
 
   /**
@@ -500,91 +274,16 @@ class DeltaLog private(
           "minWriterVersion" -> protocol.minWriterVersion))
       throw new InvalidProtocolVersionException
     }
-
-    if (logUpgradeMessage && isProtocolOld(protocol)) {
-      recordDeltaEvent(this, "delta.protocol.warning")
-      logConsole(oldProtocolMessage(protocol))
-    }
-  }
-
-  /* ------------------- *
-   |  History Management |
-   * ------------------- */
-
-  /** Get the snapshot at `version`. */
-  def getSnapshotAt(
-      version: Long,
-      commitTimestamp: Option[Long] = None,
-      lastCheckpointHint: Option[CheckpointInstance] = None): Snapshot = {
-    val current = snapshot
-    if (current.version == version) {
-      return current
-    }
-
-    // Do not use the hint if the version we're asking for is smaller than the last checkpoint hint
-    val lastCheckpoint = lastCheckpointHint.collect { case ci if ci.version <= version => ci }
-      .orElse(findLastCompleteCheckpoint(CheckpointInstance(version, None)))
-    val lastCheckpointFiles = lastCheckpoint.map { c =>
-      c.getCorrespondingFiles(logPath)
-    }.toSeq.flatten
-    val checkpointVersion = lastCheckpoint.map(_.version)
-    if (checkpointVersion.isEmpty) {
-      val versionZeroFile = deltaFile(logPath, 0L)
-      val versionZeroFileExists = store.listFrom(versionZeroFile)
-        .take(1)
-        .exists(_.getPath.getName == versionZeroFile.getName)
-      if (!versionZeroFileExists) {
-        throw DeltaErrors.logFileNotFoundException(versionZeroFile, 0L, metadata)
-      }
-    }
-    val startVersion = checkpointVersion.getOrElse(-1L) + 1
-    // Listing the files may be more efficient than getting the file status for each file
-    val deltaData = store.listFrom(deltaFile(logPath, startVersion))
-      .filter(f => isDeltaFile(f.getPath))
-      .takeWhile(f => deltaVersion(f.getPath) <= version)
-      .toArray
-    val deltaFileVersions = deltaData.map(f => deltaVersion(f.getPath))
-    if (deltaFileVersions.nonEmpty) {
-      // deltaFileVersions can be empty if we're loading a version for which a checkpoint exists
-      verifyDeltaVersions(deltaFileVersions)
-      require(deltaFileVersions.head == startVersion,
-        s"Did not get the first delta file version: $startVersion to compute Snapshot")
-      require(deltaFileVersions.last == version,
-        s"Did not get the last delta file version: $version to compute Snapshot")
-    }
-
-    val deltaIndex = DeltaLogFileIndex(DeltaLog.COMMIT_FILE_FORMAT, deltaData)
-    val checkpointIndex =
-      DeltaLogFileIndex(DeltaLog.CHECKPOINT_FILE_FORMAT, fs, lastCheckpointFiles)
-
-    new Snapshot(
-      logPath,
-      version,
-      None,
-      checkpointIndex :: deltaIndex :: Nil,
-      minFileRetentionTimestamp,
-      this,
-      commitTimestamp.getOrElse(-1L))
   }
 
   /* ---------------------------------------- *
    |  Log Directory Management and Retention  |
    * ---------------------------------------- */
 
-  def isValid(): Boolean = {
-    val expectedExistingFile = deltaFile(logPath, currentSnapshot.version)
-    try {
-      store.listFrom(expectedExistingFile)
-        .take(1)
-        .exists(_.getPath.getName == expectedExistingFile.getName)
-    } catch {
-      case _: FileNotFoundException =>
-        // Parent of expectedExistingFile doesn't exist
-        false
-    }
-  }
+  /** Whether a Delta table exists at this directory. */
+  def tableExists: Boolean = snapshot.version >= 0
 
-  def isSameLogAs(otherLog: DeltaLog): Boolean = this.tableId == otherLog.tableId
+  def isSameLogAs(otherLog: DeltaLog): Boolean = this.compositeId == otherLog.compositeId
 
   /** Creates the log directory if it does not exist. */
   def ensureLogDirectoryExist(): Unit = {
@@ -630,23 +329,13 @@ class DeltaLog private(
    */
   def createRelation(
       partitionFilters: Seq[Expression] = Nil,
-      timeTravel: Option[DeltaTimeTravelSpec] = None): BaseRelation = {
-
-    val versionToUse = timeTravel.map { tt =>
-      val (version, accessType) = DeltaTableUtils.resolveTimeTravelVersion(
-        spark.sessionState.conf, this, tt)
-      val source = tt.creationSource.getOrElse("unknown")
-      recordDeltaEvent(this, s"delta.timeTravel.$source", data = Map(
-        "tableVersion" -> snapshot.version,
-        "queriedVersion" -> version,
-        "accessType" -> accessType
-      ))
-      version
-    }
+      snapshotToUseOpt: Option[Snapshot] = None,
+      isTimeTravelQuery: Boolean = false): BaseRelation = {
 
     /** Used to link the files present in the table into the query planner. */
-    val fileIndex = TahoeLogFileIndex(spark, this, dataPath, partitionFilters, versionToUse)
-    val snapshotToUse = versionToUse.map(getSnapshotAt(_)).getOrElse(snapshot)
+    val snapshotToUse = snapshotToUseOpt.getOrElse(snapshot)
+    val fileIndex = TahoeLogFileIndex(
+      spark, this, dataPath, snapshotToUse, partitionFilters, isTimeTravelQuery)
 
     new HadoopFsRelation(
       fileIndex,
@@ -670,11 +359,6 @@ class DeltaLog private(
 }
 
 object DeltaLog extends DeltaLogging {
-
-  protected lazy val deltaLogAsyncUpdateThreadPool = {
-    val tpe = ThreadUtils.newDaemonCachedThreadPool("delta-state-update", 8)
-    ExecutionContext.fromExecutorService(tpe)
-  }
 
   /**
    * We create only a single [[DeltaLog]] for any given path to avoid wasted work
@@ -727,6 +411,40 @@ object DeltaLog extends DeltaLogging {
   def forTable(spark: SparkSession, dataPath: Path, clock: Clock): DeltaLog = {
     apply(spark, new Path(dataPath, "_delta_log"), clock)
   }
+
+  /** Helper for creating a log for the table. */
+  def forTable(spark: SparkSession, tableName: TableIdentifier): DeltaLog = {
+    forTable(spark, tableName, new SystemClock)
+  }
+
+  /** Helper for creating a log for the table. */
+  def forTable(spark: SparkSession, table: CatalogTable): DeltaLog = {
+    forTable(spark, table, new SystemClock)
+  }
+
+  /** Helper for creating a log for the table. */
+  def forTable(spark: SparkSession, tableName: TableIdentifier, clock: Clock): DeltaLog = {
+    if (DeltaTableIdentifier.isDeltaPath(spark, tableName)) {
+      forTable(spark, new Path(tableName.table))
+    } else {
+      forTable(spark, spark.sessionState.catalog.getTableMetadata(tableName), clock)
+    }
+  }
+
+  /** Helper for creating a log for the table. */
+  def forTable(spark: SparkSession, table: CatalogTable, clock: Clock): DeltaLog = {
+    apply(spark, new Path(new Path(table.location), "_delta_log"), clock)
+  }
+
+  /** Helper for creating a log for the table. */
+  def forTable(spark: SparkSession, deltaTable: DeltaTableIdentifier): DeltaLog = {
+    if (deltaTable.path.isDefined) {
+      forTable(spark, deltaTable.path.get)
+    } else {
+      forTable(spark, deltaTable.table.get)
+    }
+  }
+
   // TODO: Don't assume the data path here.
   def apply(spark: SparkSession, rawPath: Path, clock: Clock = new SystemClock): DeltaLog = {
     val hadoopConf = spark.sessionState.newHadoopConf()
@@ -737,7 +455,7 @@ object DeltaLog extends DeltaLogging {
     // - Different `scheme`
     // - Different `authority` (e.g., different user tokens in the path)
     // - Different mount point.
-    val cached = try {
+    try {
       deltaLogCache.get(path, new Callable[DeltaLog] {
         override def call(): DeltaLog = recordDeltaOperation(
             null, "delta.log.create", Map(TAG_TAHOE_PATH -> path.getParent.toString)) {
@@ -749,15 +467,6 @@ object DeltaLog extends DeltaLogging {
     } catch {
       case e: com.google.common.util.concurrent.UncheckedExecutionException =>
         throw e.getCause
-    }
-
-    // Invalidate the cache if the reference is no longer valid as a result of the
-    // log being deleted.
-    if (cached.snapshot.version == -1 || cached.isValid) {
-      cached
-    } else {
-      deltaLogCache.invalidate(path)
-      apply(spark, path)
     }
   }
 
@@ -831,7 +540,4 @@ object DeltaLog extends DeltaLogging {
         }
     })
   }
-
-  private lazy val COMMIT_FILE_FORMAT = new JsonFileFormat
-  private lazy val CHECKPOINT_FILE_FORMAT = new ParquetFileFormat
 }

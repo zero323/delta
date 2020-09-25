@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,13 @@
 
 package org.apache.spark.sql.delta.test
 
+import org.apache.spark.sql.delta.catalog.DeltaCatalog
 import io.delta.sql.DeltaSparkSessionExtension
 
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.{SparkSession, SparkSessionExtensions}
-import org.apache.spark.sql.test.{TestSparkSession, SharedSparkSession}
+import org.apache.spark.sql.test.{SharedSparkSession, TestSparkSession}
 
 /**
  * Because `TestSparkSession` doesn't pick up the conf `spark.sql.extensions` in Spark 2.4.x, we use
@@ -37,13 +39,15 @@ class DeltaTestSparkSession(sparkConf: SparkConf) extends TestSparkSession(spark
 }
 
 /**
- * A trait for tests that are testing Delta's own SQL commands. This will set up Delta's extension
- * for tests running with Spark 2.4.x.
+ * A trait for tests that are testing a fully set up SparkSession with all of Delta's requirements,
+ * such as the configuration of the DeltaCatalog and the addition of all Delta extensions.
  */
 trait DeltaSQLCommandTest { self: SharedSparkSession =>
 
   override protected def createSparkSession: TestSparkSession = {
     SparkSession.cleanupAnyExistingSession()
-    new DeltaTestSparkSession(sparkConf)
+    val session = new DeltaTestSparkSession(sparkConf)
+    session.conf.set(SQLConf.V2_SESSION_CATALOG_IMPLEMENTATION.key, classOf[DeltaCatalog].getName)
+    session
   }
 }

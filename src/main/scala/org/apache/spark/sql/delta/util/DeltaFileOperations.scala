@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -201,6 +201,18 @@ object DeltaFileOperations extends DeltaLogging {
       recurseDirectories(logStore, firstLevelDirsAndFiles, hiddenFileNameFilter)
     }
     spark.createDataset(allDirsAndFiles)
+  }
+
+  /**
+   * Lists the directory locally using LogStore without launching a spark job.
+   */
+  def localListDirs(
+      spark: SparkSession,
+      dirs: Seq[String],
+      recursive: Boolean = true,
+      fileFilter: String => Boolean = defaultHiddenFileFilter): Seq[SerializableFileStatus] = {
+    val logStore = LogStore(SparkEnv.get.conf, spark.sessionState.newHadoopConf)
+    listUsingLogStore(logStore, dirs.toIterator, recurse = recursive, fileFilter).toSeq
   }
 
   /**

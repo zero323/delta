@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,24 +16,34 @@
 
 package org.apache.spark.sql.delta
 
-import org.apache.spark.sql.delta.actions.CommitInfo
+// scalastyle:off import.ordering.noEmptyLine
+import java.io.File
+
+ // Edge
+import org.apache.spark.sql.delta.actions.{Action, CommitInfo, Metadata, Protocol}
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
+import org.apache.spark.sql.delta.util.FileNames
+import org.scalactic.source.Position
 import org.scalatest.Tag
 
 import org.apache.spark.sql.{AnalysisException, Column, DataFrame, QueryTest, Row}
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.util.Utils
 
 trait DescribeDeltaHistorySuiteBase
   extends QueryTest
-  with SharedSparkSession {
+  with SharedSparkSession  with DeltaSQLCommandTest {
 
   import testImplicits._
 
-  protected val evolvabilityResource = "src/test/resources/delta/history/delta-0.2.0"
+  protected val evolvabilityResource = {
+    new File("src/test/resources/delta/history/delta-0.2.0").getAbsolutePath()
+  }
 
   protected val evolvabilityLastOp = Seq("STREAMING UPDATE", null, null)
 
@@ -49,16 +59,23 @@ trait DescribeDeltaHistorySuiteBase
       basePath: String,
       expected: Seq[String],
       columns: Seq[Column] = Seq($"operation", $"operationParameters.mode")): Unit = {
-    val df = getHistory(basePath, Some(1))
-    checkAnswer(
-      df.select(columns: _*),
-      Seq(Row(expected: _*))
-    )
+    val df = io.delta.tables.DeltaTable.forPath(spark, basePath).history(1)
+    checkAnswer(df.select(columns: _*), Seq(Row(expected: _*)))
+    val df2 = spark.sql(s"DESCRIBE HISTORY delta.`$basePath` LIMIT 1")
+    checkAnswer(df2.select(columns: _*), Seq(Row(expected: _*)))
   }
 
   protected def checkOperationMetrics(
       expectedMetrics: Map[String, String],
-      operationMetrics: Map[String, String]): Unit = {
+      operationMetrics: Map[String, String],
+      metricsSchema: Set[String]): Unit = {
+    if (metricsSchema != operationMetrics.keySet) {
+      fail(
+        s"""The collected metrics does not match the defined schema for the metrics.
+           | Expected : $metricsSchema
+           | Actual : ${operationMetrics.keySet}
+           """.stripMargin)
+    }
     expectedMetrics.keys.foreach { key =>
       if (!operationMetrics.contains(key)) {
         fail(s"The recorded operation metrics does not contain key: $key")
@@ -82,21 +99,243 @@ trait DescribeDeltaHistorySuiteBase
       .asInstanceOf[Map[String, String]]
   }
 
-  def getHistory(path: String, limit: Option[Int] = None): DataFrame = {
-    val deltaTable = io.delta.tables.DeltaTable.forPath(spark, path)
-    if (limit.isDefined) {
-      deltaTable.history(limit.get)
-    } else {
-      deltaTable.history()
-    }
-  }
-
-  testWithFlag("logging and limit") {
+  testWithFlag("basic case - Scala history with path-based table") {
     val tempDir = Utils.createTempDir().toString
     Seq(1, 2, 3).toDF().write.format("delta").save(tempDir)
     Seq(4, 5, 6).toDF().write.format("delta").mode("overwrite").save(tempDir)
-    assert(getHistory(tempDir).count === 2)
-    checkLastOperation(tempDir, Seq("WRITE", "Overwrite"))
+
+    val deltaTable = io.delta.tables.DeltaTable.forPath(spark, tempDir)
+    // Full History
+    checkAnswer(
+      deltaTable.history().select("operation", "operationParameters.mode"),
+      Seq(Row("WRITE", "Overwrite"), Row("WRITE", "ErrorIfExists")))
+
+    // History with limit
+    checkAnswer(
+      deltaTable.history(1).select("operation", "operationParameters.mode"),
+      Seq(Row("WRITE", "Overwrite")))
+  }
+
+  test("basic case - Scala history with name-based table") {
+    withTable("delta_test") {
+      Seq(1, 2, 3).toDF().write.format("delta").saveAsTable("delta_test")
+      Seq(4, 5, 6).toDF().write.format("delta").mode("overwrite").saveAsTable("delta_test")
+
+      val deltaTable = io.delta.tables.DeltaTable.forName(spark, "delta_test")
+      // Full History
+      checkAnswer(
+        deltaTable.history().select("operation"),
+        Seq(Row("CREATE OR REPLACE TABLE AS SELECT"), Row("CREATE TABLE AS SELECT")))
+
+      // History with limit
+      checkAnswer(
+        deltaTable.history(1).select("operation"),
+        Seq(Row("CREATE OR REPLACE TABLE AS SELECT")))
+    }
+  }
+
+  testWithFlag("basic case - SQL describe history with path-based table") {
+    val tempDir = Utils.createTempDir().toString
+    Seq(1, 2, 3).toDF().write.format("delta").save(tempDir)
+    Seq(4, 5, 6).toDF().write.format("delta").mode("overwrite").save(tempDir)
+
+    // With delta.`path` format
+    checkAnswer(
+      sql(s"DESCRIBE HISTORY delta.`$tempDir`").select("operation", "operationParameters.mode"),
+      Seq(Row("WRITE", "Overwrite"), Row("WRITE", "ErrorIfExists")))
+
+    checkAnswer(
+      sql(s"DESCRIBE HISTORY delta.`$tempDir` LIMIT 1")
+        .select("operation", "operationParameters.mode"),
+      Seq(Row("WRITE", "Overwrite")))
+
+    // With direct path format
+    checkAnswer(
+      sql(s"DESCRIBE HISTORY '$tempDir'").select("operation", "operationParameters.mode"),
+      Seq(Row("WRITE", "Overwrite"), Row("WRITE", "ErrorIfExists")))
+
+    checkAnswer(
+      sql(s"DESCRIBE HISTORY '$tempDir' LIMIT 1")
+        .select("operation", "operationParameters.mode"),
+      Seq(Row("WRITE", "Overwrite")))
+  }
+
+  testWithFlag("basic case - SQL describe history with name-based table") {
+    withTable("delta_test") {
+      Seq(1, 2, 3).toDF().write.format("delta").saveAsTable("delta_test")
+      Seq(4, 5, 6).toDF().write.format("delta").mode("overwrite").saveAsTable("delta_test")
+
+      checkAnswer(
+        sql(s"DESCRIBE HISTORY delta_test").select("operation"),
+        Seq(Row("CREATE OR REPLACE TABLE AS SELECT"), Row("CREATE TABLE AS SELECT")))
+
+      checkAnswer(
+        sql(s"DESCRIBE HISTORY delta_test LIMIT 1").select("operation"),
+        Seq(Row("CREATE OR REPLACE TABLE AS SELECT")))
+    }
+  }
+
+  testWithFlag("describe history fails on views") {
+    val tempDir = Utils.createTempDir().toString
+    Seq(1, 2, 3).toDF().write.format("delta").save(tempDir)
+    val viewName = "delta_view"
+    withView(viewName) {
+      sql(s"create view $viewName as select * from delta.`$tempDir`")
+
+      val e = intercept[AnalysisException] {
+        sql(s"DESCRIBE HISTORY $viewName").collect()
+      }
+      assert(e.getMessage.contains("history of a view"))
+    }
+  }
+
+  testWithFlag("operations - create table") {
+    withTable("delta_test") {
+      sql(
+        s"""create table delta_test (
+           |  a int,
+           |  b string
+           |)
+           |using delta
+           |partitioned by (b)
+           |comment 'this is my table'
+           |tblproperties (delta.appendOnly=true)
+         """.stripMargin)
+      checkLastOperation(
+        spark.sessionState.catalog.defaultTablePath(TableIdentifier("delta_test")).toString,
+        Seq(
+          "CREATE TABLE",
+          "true",
+          """["b"]""",
+          """{"delta.appendOnly":"true"}""",
+          "this is my table"),
+        Seq(
+          $"operation", $"operationParameters.isManaged", $"operationParameters.partitionBy",
+          $"operationParameters.properties", $"operationParameters.description"))
+    }
+  }
+
+  testWithFlag("operations - ctas (saveAsTable)") {
+    val tempDir = Utils.createTempDir().toString
+    withTable("delta_test") {
+      Seq((1, "a"), (2, "3")).toDF("id", "data").write.format("delta")
+        .option("path", tempDir).saveAsTable("delta_test")
+      checkLastOperation(
+        tempDir,
+        Seq("CREATE TABLE AS SELECT", "false", """[]""", "{}", null),
+        Seq($"operation", $"operationParameters.isManaged", $"operationParameters.partitionBy",
+          $"operationParameters.properties", $"operationParameters.description"))
+    }
+  }
+
+  testWithFlag("operations - ctas (sql)") {
+    val tempDir = Utils.createTempDir().toString
+    withTable("delta_test") {
+      sql(
+        s"""create table delta_test
+           |using delta
+           |location '$tempDir'
+           |tblproperties (delta.appendOnly=true)
+           |partitioned by (b)
+           |as select 1 as a, 'x' as b
+         """.stripMargin)
+      checkLastOperation(
+        tempDir,
+        Seq("CREATE TABLE AS SELECT",
+          "false",
+          """["b"]""",
+          """{"delta.appendOnly":"true"}""", null),
+        Seq($"operation", $"operationParameters.isManaged", $"operationParameters.partitionBy",
+          $"operationParameters.properties", $"operationParameters.description"))
+    }
+    val tempDir2 = Utils.createTempDir().toString
+    withTable("delta_test") {
+      sql(
+        s"""create table delta_test
+           |using delta
+           |location '$tempDir2'
+           |comment 'this is my table'
+           |as select 1 as a, 'x' as b
+         """.stripMargin)
+      // TODO(burak): Fix comments for CTAS
+      checkLastOperation(
+        tempDir2,
+        Seq("CREATE TABLE AS SELECT",
+          "false", """[]""", """{}""", null),
+        Seq($"operation", $"operationParameters.isManaged", $"operationParameters.partitionBy",
+          $"operationParameters.properties", $"operationParameters.description"))
+    }
+  }
+
+
+  testWithFlag("operations - [un]set tbproperties") {
+    withTable("delta_test") {
+      sql("CREATE TABLE delta_test (v1 int, v2 string) USING delta")
+
+      sql("""
+            |ALTER TABLE delta_test
+            |SET TBLPROPERTIES (
+            |  'delta.checkpointInterval' = '20',
+            |  'key' = 'value'
+            |)""".stripMargin)
+      checkLastOperation(
+        spark.sessionState.catalog.defaultTablePath(TableIdentifier("delta_test")).toString,
+        Seq("SET TBLPROPERTIES", """{"delta.checkpointInterval":"20","key":"value"}"""),
+        Seq($"operation", $"operationParameters.properties"))
+
+      sql("ALTER TABLE delta_test UNSET TBLPROPERTIES ('key')")
+      checkLastOperation(
+        spark.sessionState.catalog.defaultTablePath(TableIdentifier("delta_test")).toString,
+        Seq("UNSET TBLPROPERTIES", """["key"]""", "true"),
+        Seq($"operation", $"operationParameters.properties", $"operationParameters.ifExists"))
+    }
+  }
+
+  testWithFlag("operations - add columns") {
+    withTable("delta_test") {
+      sql("CREATE TABLE delta_test (v1 int, v2 string) USING delta")
+
+      sql("ALTER TABLE delta_test ADD COLUMNS (v3 long, v4 int AFTER v1)")
+      val column3 = """{"name":"v3","type":"long","nullable":true,"metadata":{}}"""
+      val column4 = """{"name":"v4","type":"integer","nullable":true,"metadata":{}}"""
+      checkLastOperation(
+        spark.sessionState.catalog.defaultTablePath(TableIdentifier("delta_test")).toString,
+        Seq("ADD COLUMNS",
+          s"""[{"column":$column3},{"column":$column4,"position":"AFTER v1"}]"""),
+        Seq($"operation", $"operationParameters.columns"))
+    }
+  }
+
+  testWithFlag("operations - change column") {
+    withTable("delta_test") {
+      sql("CREATE TABLE delta_test (v1 int, v2 string) USING delta")
+
+      sql("ALTER TABLE delta_test CHANGE COLUMN v1 v1 integer AFTER v2")
+      checkLastOperation(
+        spark.sessionState.catalog.defaultTablePath(TableIdentifier("delta_test")).toString,
+        Seq("CHANGE COLUMN",
+          s"""{"name":"v1","type":"integer","nullable":true,"metadata":{}}""",
+          "AFTER v2"),
+        Seq($"operation", $"operationParameters.column", $"operationParameters.position"))
+    }
+  }
+
+  test("operations - upgrade protocol") {
+    withTempDir { path =>
+      val log = DeltaLog.forTable(spark, path)
+      log.ensureLogDirectoryExist()
+      log.store.write(
+        FileNames.deltaFile(log.logPath, 0),
+        Iterator(Metadata(schemaString = spark.range(1).schema.json).json, Protocol(1, 1).json))
+      log.update()
+      log.upgradeProtocol()
+      checkLastOperation(
+        path.toString,
+        Seq("UPGRADE PROTOCOL",
+          s"""{"minReaderVersion":${Action.readerVersion},""" +
+            s""""minWriterVersion":${Action.writerVersion}}"""),
+        Seq($"operation", $"operationParameters.newProtocol"))
+    }
   }
 
   testWithFlag("operations - insert append with partition columns") {
@@ -151,6 +390,7 @@ trait DescribeDeltaHistorySuiteBase
   }
 
   test("operations - streaming append with transaction ids") {
+
     val tempDir = Utils.createTempDir().toString
     val checkpoint = Utils.createTempDir().toString
 
@@ -210,7 +450,7 @@ trait DescribeDeltaHistorySuiteBase
       Seq(1, 2, 3).toDF().write.format("delta").mode("append").save(tempDir.toString)
     }
 
-    assert(getHistory(tempDir).count() === 2)
+    assert(spark.sql(s"DESCRIBE HISTORY delta.`$tempDir`").count() === 2)
     checkLastOperation(tempDir, Seq("WRITE", "Append"))
   }
 
@@ -229,8 +469,11 @@ trait DescribeDeltaHistorySuiteBase
       Seq(4).toDF().write.format("delta").mode("overwrite").save(tempDir)
     }
 
-    val ans = getHistory(tempDir).as[CommitInfo].collect()
+    val ans = io.delta.tables.DeltaTable.forPath(spark, tempDir).history().as[CommitInfo].collect()
     assert(ans.map(_.version) === Seq(Some(4), Some(3), Some(2), Some(1), Some(0)))
+
+    val ans2 = sql(s"DESCRIBE HISTORY delta.`$tempDir`").as[CommitInfo].collect()
+    assert(ans2.map(_.version) === Seq(Some(4), Some(3), Some(2), Some(1), Some(0)))
   }
 
   test("read version") {
@@ -254,7 +497,7 @@ trait DescribeDeltaHistorySuiteBase
     withSQLConf(DeltaSQLConf.DELTA_COMMIT_INFO_ENABLED.key -> "false") {
       Seq(5).toDF().write.format("delta").mode("append").save(tempDir)   // readVersion = None
     }
-    val ans = getHistory(tempDir).as[CommitInfo].collect()
+    val ans = sql(s"DESCRIBE HISTORY delta.`$tempDir`").as[CommitInfo].collect()
     assert(ans.map(x => x.version.get -> x.readVersion) ===
       Seq(5 -> None, 4 -> Some(1), 3 -> Some(2), 2 -> Some(1), 1 -> Some(0), 0 -> None))
   }
@@ -264,15 +507,6 @@ trait DescribeDeltaHistorySuiteBase
       evolvabilityResource,
       evolvabilityLastOp,
       Seq($"operation", $"operationParameters.mode", $"operationParameters.partitionBy"))
-  }
-
-  testWithFlag("describe history with delta table identifier") {
-    val tempDir = Utils.createTempDir().toString
-    Seq(1, 2, 3).toDF().write.format("delta").save(tempDir)
-    Seq(4, 5, 6).toDF().write.format("delta").mode("overwrite").save(tempDir)
-    val df = sql(s"DESCRIBE HISTORY delta.`$tempDir` LIMIT 1")
-    checkAnswer(df.select("operation", "operationParameters.mode"),
-      Seq(Row("WRITE", "Overwrite")))
   }
 
   test("using on non delta") {
@@ -313,17 +547,15 @@ trait DescribeDeltaHistorySuiteBase
         val deltaTable = io.delta.tables.DeltaTable.forPath(tempDir.getAbsolutePath)
 
         // get last command history
-        val lastCmd = deltaTable.history(1)
+        val operationMetrics = getOperationMetrics(deltaTable.history(1))
+        val expectedMetrics = Map(
+          "numFiles" -> "5",
+          "numOutputRows" -> "100"
+        )
 
         // Check if operation metrics from history are accurate
-        assert(lastCmd.select("operationMetrics.numFiles").take(1).head.getString(0).toLong
-          == 5)
-
-        assert(lastCmd.select("operationMetrics.numOutputBytes").take(1).head.getString(0).toLong
-          > 0)
-
-        assert(lastCmd.select("operationMetrics.numOutputRows").take(1).head.getString(0).toLong
-          == 100)
+        checkOperationMetrics(expectedMetrics, operationMetrics, DeltaOperationMetrics.WRITE)
+        assert(operationMetrics("numOutputBytes").toLong > 0)
       }
     }
   }
@@ -353,7 +585,7 @@ trait DescribeDeltaHistorySuiteBase
           "numOutputRows" -> "100",
           "numSourceRows" -> "100"
         )
-        checkOperationMetrics(expectedMetrics, operationMetrics)
+        checkOperationMetrics(expectedMetrics, operationMetrics, DeltaOperationMetrics.MERGE)
       }
     }
   }
@@ -383,7 +615,8 @@ trait DescribeDeltaHistorySuiteBase
           "numRemovedFiles" -> "0",
           "numOutputRows" -> "1"
         )
-        checkOperationMetrics(expectedMetrics, operationMetrics)
+        checkOperationMetrics(
+          expectedMetrics, operationMetrics, DeltaOperationMetrics.STREAMING_UPDATE)
 
         // check if second batch also returns correct metrics.
         memoryStream.addData(1, 2, 3)
@@ -394,7 +627,9 @@ trait DescribeDeltaHistorySuiteBase
           "numRemovedFiles" -> "0",
           "numOutputRows" -> "3"
         )
-        checkOperationMetrics(expectedMetrics2, operationMetrics)
+        checkOperationMetrics(
+          expectedMetrics2, operationMetrics, DeltaOperationMetrics.STREAMING_UPDATE)
+        assert(operationMetrics("numOutputBytes").toLong > 0)
         q.stop()
       }
     }
@@ -431,12 +666,230 @@ trait DescribeDeltaHistorySuiteBase
           "numRemovedFiles" -> "1",
           "numOutputRows" -> "1"
         )
-        checkOperationMetrics(expectedMetrics, operationMetrics)
+        checkOperationMetrics(
+          expectedMetrics, operationMetrics, DeltaOperationMetrics.STREAMING_UPDATE)
       }
     }
   }
+
+  test("operation metrics - update") {
+    withSQLConf(DeltaSQLConf.DELTA_HISTORY_METRICS_ENABLED.key -> "true") {
+      withTempDir { tempDir =>
+        // Create the initial table as a single file
+        Seq(1, 2, 5, 11, 21, 3, 4, 6, 9, 7, 8, 0).toDF("key")
+          .withColumn("value", 'key % 2)
+          .write
+          .format("delta")
+          .save(tempDir.getAbsolutePath)
+
+        // append additional data with the same number range to the table.
+        // This data is saved as a separate file as well
+        Seq(15, 16, 17).toDF("key")
+          .withColumn("value", 'key % 2)
+          .repartition(1)
+          .write
+          .format("delta")
+          .mode("append")
+          .save(tempDir.getAbsolutePath)
+        val deltaTable = io.delta.tables.DeltaTable.forPath(spark, tempDir.getAbsolutePath)
+        val deltaLog = DeltaLog.forTable(spark, tempDir.getAbsolutePath)
+        deltaLog.snapshot.numOfFiles
+
+        // update the table
+        deltaTable.update(col("key") === lit("16"), Map("value" -> lit("1")))
+        // The file from the append gets updated but the file from the initial table gets scanned
+        // as well. We want to make sure numCopied rows is calculated from written files and not
+        // scanned files[SC-33980]
+
+        // get operation metrics
+        val operationMetrics = getOperationMetrics(deltaTable.history(1))
+        val expectedMetrics = Map(
+          "numAddedFiles" -> "1",
+          "numRemovedFiles" -> "1",
+          "numUpdatedRows" -> "1",
+          "numCopiedRows" -> "2" // There should be only three rows in total(updated + copied)
+        )
+        checkOperationMetrics(expectedMetrics, operationMetrics, DeltaOperationMetrics.UPDATE)
+      }
+    }
+  }
+
+  test("operation metrics - update - partitioned column") {
+    withSQLConf(DeltaSQLConf.DELTA_HISTORY_METRICS_ENABLED.key -> "true") {
+      val numRows = 100
+      val numPartitions = 5
+      withTempDir { tempDir =>
+        spark.range(numRows)
+          .withColumn("c1", 'id + 1)
+          .withColumn("c2", 'id % numPartitions)
+          .write
+          .partitionBy("c2")
+          .format("delta")
+          .save(tempDir.getAbsolutePath)
+
+        val deltaTable = io.delta.tables.DeltaTable.forPath(tempDir.getAbsolutePath)
+        val deltaLog = DeltaLog.forTable(spark, tempDir.getAbsolutePath)
+        val numFilesBeforeUpdate = deltaLog.snapshot.numOfFiles
+        deltaTable.update(col("c2") < 1, Map("c2" -> lit("1")))
+        val numFilesAfterUpdate = deltaLog.snapshot.numOfFiles
+
+        val operationMetrics = getOperationMetrics(deltaTable.history(1))
+        val newFiles = numFilesAfterUpdate - numFilesBeforeUpdate
+        val oldFiles = numFilesBeforeUpdate / numPartitions
+        val addedFiles = newFiles + oldFiles
+        val expectedMetrics = Map(
+          "numUpdatedRows" -> (numRows / numPartitions).toString,
+          "numCopiedRows" -> "0",
+          "numAddedFiles" -> addedFiles.toString,
+          "numRemovedFiles" -> (numFilesBeforeUpdate / numPartitions).toString
+        )
+        checkOperationMetrics(expectedMetrics, operationMetrics, DeltaOperationMetrics.UPDATE)
+      }
+    }
+  }
+
+  test("operation metrics - delete") {
+    withSQLConf(DeltaSQLConf.DELTA_HISTORY_METRICS_ENABLED.key -> "true") {
+      withTempDir { tempDir =>
+        // Create the initial table as a single file
+        Seq(1, 2, 5, 11, 21, 3, 4, 6, 9, 7, 8, 0).toDF("key")
+          .withColumn("value", 'key % 2)
+          .repartition(1)
+          .write
+          .format("delta")
+          .save(tempDir.getAbsolutePath)
+
+        // Append to the initial table additional data in the same numerical range
+        Seq(15, 16, 17).toDF("key")
+          .withColumn("value", 'key % 2)
+          .repartition(1)
+          .write
+          .format("delta")
+          .mode("append")
+          .save(tempDir.getAbsolutePath)
+        val deltaTable = io.delta.tables.DeltaTable.forPath(spark, tempDir.getAbsolutePath)
+        val deltaLog = DeltaLog.forTable(spark, tempDir.getAbsolutePath)
+        deltaLog.snapshot.numOfFiles
+
+        // delete the table
+        deltaTable.delete(col("key") === lit("16"))
+        // The file from the append gets deleted but the file from the initial table gets scanned
+        // as well. We want to make sure numCopied rows is calculated from the written files instead
+        // of the scanned files.[SC-33980]
+
+        // get operation metrics
+        val operationMetrics = getOperationMetrics(deltaTable.history(1))
+        val expectedMetrics = Map(
+          "numAddedFiles" -> "1",
+          "numRemovedFiles" -> "1",
+          "numDeletedRows" -> "1",
+          "numCopiedRows" -> "2" // There should be only three rows in total(deleted + copied)
+        )
+        checkOperationMetrics(expectedMetrics, operationMetrics, DeltaOperationMetrics.DELETE)
+      }
+    }
+  }
+
+  test("operation metrics - delete - partition column") {
+    withSQLConf(DeltaSQLConf.DELTA_HISTORY_METRICS_ENABLED.key -> "true") {
+      val numRows = 100
+      val numPartitions = 5
+      withTempDir { tempDir =>
+        spark.range(numRows)
+          .withColumn("c1", 'id % numPartitions)
+          .write
+          .format("delta")
+          .partitionBy("c1")
+          .save(tempDir.getAbsolutePath)
+        val deltaLog = DeltaLog.forTable(spark, tempDir.getAbsolutePath)
+        val numFilesBeforeDelete = deltaLog.snapshot.numOfFiles
+        val deltaTable = io.delta.tables.DeltaTable.forPath(tempDir.getAbsolutePath)
+
+        deltaTable.delete("c1 = 1")
+        val operationMetrics = getOperationMetrics(deltaTable.history(1))
+        val expectedMetrics = Map[String, String](
+          "numRemovedFiles" -> (numFilesBeforeDelete / numPartitions).toString
+        )
+        // row level metrics are not collected for deletes with parition columns
+        checkOperationMetrics(
+          expectedMetrics, operationMetrics, DeltaOperationMetrics.DELETE_PARTITIONS)
+      }
+    }
+  }
+
+  test("operation metrics - delete - full") {
+    withSQLConf(DeltaSQLConf.DELTA_HISTORY_METRICS_ENABLED.key -> "true") {
+      val numRows = 100
+      val numPartitions = 5
+      withTempDir { tempDir =>
+        spark.range(numRows)
+          .withColumn("c1", 'id % numPartitions)
+          .write
+          .format("delta")
+          .partitionBy("c1")
+          .save(tempDir.getAbsolutePath)
+        val deltaLog = DeltaLog.forTable(spark, tempDir.getAbsolutePath)
+        val numFilesBeforeDelete = deltaLog.snapshot.numOfFiles
+        val deltaTable = io.delta.tables.DeltaTable.forPath(tempDir.getAbsolutePath)
+
+        deltaTable.delete()
+
+        val operationMetrics = getOperationMetrics(deltaTable.history(1))
+        val expectedMetrics = Map[String, String](
+          "numRemovedFiles" -> numFilesBeforeDelete.toString
+        )
+        checkOperationMetrics(
+          expectedMetrics, operationMetrics, DeltaOperationMetrics.DELETE_PARTITIONS)
+      }
+    }
+  }
+
+  test("operation metrics - convert to delta") {
+    withSQLConf(DeltaSQLConf.DELTA_HISTORY_METRICS_ENABLED.key -> "true") {
+      val numPartitions = 5
+      withTempDir { tempDir =>
+        // Create a parquet table
+        val dir = tempDir.getAbsolutePath()
+        spark.range(10)
+          .withColumn("col2", 'id % numPartitions)
+          .write
+          .format("parquet")
+          .mode("overwrite")
+          .partitionBy("col2")
+          .save(dir)
+
+        // convert to delta
+        val deltaTable = io.delta.tables.DeltaTable.convertToDelta(spark, s"parquet.`$dir`",
+          "col2 long")
+        val deltaLog = DeltaLog.forTable(spark, dir)
+        val expectedMetrics = Map(
+          "numConvertedFiles" -> deltaLog.snapshot.numOfFiles.toString
+        )
+        val operationMetrics = getOperationMetrics(deltaTable.history(1))
+        checkOperationMetrics(expectedMetrics, operationMetrics, DeltaOperationMetrics.CONVERT)
+      }
+    }
+  }
+
+  test("sort and collect the DESCRIBE HISTORY result") {
+    withTempDir { tempDir =>
+      val path = tempDir.getCanonicalPath
+      Seq(1, 2, 3).toDF().write.format("delta").save(path)
+      val rows = sql(s"DESCRIBE HISTORY delta.`$path`")
+        .orderBy("version")
+        .collect()
+      assert(rows.map(_.getAs[Long]("version")).toList == 0L :: Nil)
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+        val rows = sql(s"DESCRIBE HISTORY delta.`$path`")
+          .filter("version >= 0")
+          .orderBy("version")
+          .collect()
+        assert(rows.map(_.getAs[Long]("version")).toList == 0L :: Nil)
+      }
+    }
+  }
+
 }
 
 class DescribeDeltaHistorySuite
   extends DescribeDeltaHistorySuiteBase with DeltaSQLCommandTest
-

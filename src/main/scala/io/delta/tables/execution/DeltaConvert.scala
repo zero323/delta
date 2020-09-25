@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Databricks, Inc.
+ * Copyright (2020) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,7 +31,11 @@ trait DeltaConvertBase {
       deltaPath: Option[String]): DeltaTable = {
     val cvt = ConvertToDeltaCommand(tableIdentifier, partitionSchema, deltaPath)
     cvt.run(spark)
-    DeltaTable.forPath(spark, tableIdentifier.table)
+    if (cvt.isCatalogTable(spark.sessionState.analyzer, tableIdentifier)) {
+      DeltaTable.forName(spark, tableIdentifier.toString)
+    } else {
+      DeltaTable.forPath(spark, tableIdentifier.table)
+    }
   }
 }
 
